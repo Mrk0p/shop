@@ -33,7 +33,7 @@ async function getData() {
   });
 
   const result = data.map((item) => ({
-    date: new Intl.DateTimeFormat("en-US").format(item.createdAt),
+    date: new Intl.DateTimeFormat("en-IN").format(item.createdAt),
     revenue: item.amount / 100,
   }));
 
