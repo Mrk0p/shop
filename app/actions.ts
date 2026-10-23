@@ -259,7 +259,11 @@ export async function checkOut() {
       throw new Error("Your cart contains an invalid item. Please update your cart.");
     }
 
-    quantities.set(item.id, (quantities.get(item.id) ?? 0) + item.quantity);
+    const nextQuantity = (quantities.get(item.id) ?? 0) + item.quantity;
+    if (nextQuantity > 99) {
+      throw new Error("A maximum of 99 units per product can be checked out.");
+    }
+    quantities.set(item.id, nextQuantity);
   }
 
   const products = await prisma.product.findMany({
