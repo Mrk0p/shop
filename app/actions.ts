@@ -153,9 +153,7 @@ export async function addItem(productId: string) {
     return redirect("/");
   }
 
-  let cart: Cart | null = await redis.get(`cart-${user.id}`);
-
-  const selectedProduct = await prisma.product.findUnique({
+  const selectedProduct = await prisma.product.findFirst({
     select: {
       id: true,
       name: true,
@@ -164,51 +162,47 @@ export async function addItem(productId: string) {
     },
     where: {
       id: productId,
+      status: "published",
     },
   });
 
   if (!selectedProduct) {
-    throw new Error("No product with this id");
+    throw new Error("This product is not available.");
   }
-  let myCart = {} as Cart;
 
-  if (!cart || !cart.items) {
-    myCart = {
-      userId: user.id,
-      items: [
+  if (!Number.isSafeInteger(selectedProduct.price) || selectedProduct.price < 1) {
+    throw new Error("This product has an invalid price.");
+  }
+
+  let cart: Cart | null = await redis.get(`cart-${user.id}`);
+  const items = cart?.items ?? [];
+  const existingItem = items.find((item) => item.id === selectedProduct.id);
+
+  if (existingItem && (!Number.isSafeInteger(existingItem.quantity) || existingItem.quantity >= 99)) {
+    throw new Error("A maximum of 99 units per product can be added.");
+  }
+
+  const updatedItems = existingItem
+    ? items.map((item) =>
+        item.id === selectedProduct.id
+          ? { ...item, quantity: item.quantity + 1 }
+          : item
+      )
+    : [
+        ...items,
         {
-          price: selectedProduct.price,
           id: selectedProduct.id,
-          imageString: selectedProduct.images[0],
           name: selectedProduct.name,
+          price: selectedProduct.price,
+          imageString: selectedProduct.images[0] ?? "",
           quantity: 1,
         },
-      ],
-    };
-  } else {
-    let itemFound = false;
+      ];
 
-    myCart.items = cart.items.map((item) => {
-      if (item.id === productId) {
-        itemFound = true;
-        item.quantity += 1;
-      }
-
-      return item;
-    });
-
-    if (!itemFound) {
-      myCart.items.push({
-        id: selectedProduct.id,
-        imageString: selectedProduct.images[0],
-        name: selectedProduct.name,
-        price: selectedProduct.price,
-        quantity: 1,
-      });
-    }
-  }
-
-  await redis.set(`cart-${user.id}`, myCart);
+  await redis.set(`cart-${user.id}`, {
+    userId: user.id,
+    items: updatedItems,
+  } satisfies Cart);
 
   revalidatePath("/", "layout");
 }
@@ -245,38 +239,88 @@ export async function checkOut() {
     return redirect("/");
   }
 
-  let cart: Cart | null = await redis.get(`cart-${user.id}`);
+  const cart: Cart | null = await redis.get(`cart-${user.id}`);
 
-  if (cart && cart.items) {
-    const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] =
-      cart.items.map((item) => ({
-        price_data: {
-          currency: "usd",
-          unit_amount: item.price * 100,
-          product_data: {
-            name: item.name,
-            images: [item.imageString],
-          },
-        },
-        quantity: item.quantity,
-      }));
-
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      line_items: lineItems,
-      success_url:
-        process.env.NODE_ENV === "development"
-          ? "http://localhost:3000/payment/success"
-          : "https://shop-seven-orcin.vercel.app/payment/success",
-      cancel_url:
-        process.env.NODE_ENV === "development"
-          ? "http://localhost:3000/payment/cancel"
-          : "https://shop-seven-orcin.vercel.app/payment/cancel",
-      metadata: {
-        userId: user.id,
-      },
-    });
-
-    return redirect(session.url as string);
+  if (!cart || !Array.isArray(cart.items) || cart.items.length === 0) {
+    throw new Error("Your cart is empty.");
   }
+
+  // Treat the cart as a list of product IDs and quantities only. Prices, names,
+  // and images must always come from the database, never from cached cart data.
+  const quantities = new Map<string, number>();
+  for (const item of cart.items) {
+    if (
+      !item ||
+      typeof item.id !== "string" ||
+      !Number.isSafeInteger(item.quantity) ||
+      item.quantity < 1 ||
+      item.quantity > 99
+    ) {
+      throw new Error("Your cart contains an invalid item. Please update your cart.");
+    }
+
+    const nextQuantity = (quantities.get(item.id) ?? 0) + item.quantity;
+    if (nextQuantity > 99) {
+      throw new Error("A maximum of 99 units per product can be checked out.");
+    }
+    quantities.set(item.id, nextQuantity);
+  }
+
+  const products = await prisma.product.findMany({
+    where: {
+      id: { in: [...quantities.keys()] },
+      status: "published",
+    },
+    select: {
+      id: true,
+      name: true,
+      price: true,
+      images: true,
+    },
+  });
+
+  if (products.length !== quantities.size) {
+    throw new Error("One or more products are no longer available. Please update your cart.");
+  }
+
+  const lineItems: Stripe.Checkout.SessionCreateParams.LineItem[] = products.map((product) => {
+    if (!Number.isSafeInteger(product.price) || product.price < 1) {
+      throw new Error("A product has an invalid price and cannot be checked out.");
+    }
+
+    return {
+      price_data: {
+        // Product prices in the store are displayed in rupees; Stripe expects paise.
+        currency: "inr",
+        unit_amount: product.price * 100,
+        product_data: {
+          name: product.name,
+          ...(product.images[0] ? { images: [product.images[0]] } : {}),
+        },
+      },
+      quantity: quantities.get(product.id)!,
+    };
+  });
+
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    line_items: lineItems,
+    success_url:
+      process.env.NODE_ENV === "development"
+        ? "http://localhost:3000/payment/success"
+        : "https://shop-seven-orcin.vercel.app/payment/success",
+    cancel_url:
+      process.env.NODE_ENV === "development"
+        ? "http://localhost:3000/payment/cancel"
+        : "https://shop-seven-orcin.vercel.app/payment/cancel",
+    metadata: {
+      userId: user.id,
+    },
+  });
+
+  if (!session.url) {
+    throw new Error("Stripe did not return a checkout URL.");
+  }
+
+  return redirect(session.url);
 }
